@@ -1,1 +1,21 @@
+[theme]
+base = "dark"
+backgroundColor = "#0B1520"
+secondaryBackgroundColor = "#0F1923"
+primaryColor = "#00C9B1"
+textColor = "#E2E8F0"
+font = "sans serif"
 
+[server]
+headless = true
+enableCORS = false
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[ui]
+hideSidebarNav = true
