@@ -15,8 +15,12 @@ RED    = "#EF4444"
 SLATE  = "#475569"
 MUTED  = "rgba(255,255,255,0.25)"
 
-CLIENT_COLORS = {"C001": TEAL, "C002": BLUE, "C003": PURPLE}
-CLIENT_NAMES  = {"C001": "Alpha Retail", "C002": "Beta Logistics", "C003": "Gamma Finance"}
+# !! These are DEFAULTS only — they get overridden at runtime by build_client_maps()
+# so charts always reflect actual client names from your Google Sheet.
+CLIENT_COLORS = {}
+CLIENT_NAMES  = {}
+
+COLOR_CYCLE = [TEAL, BLUE, PURPLE, GOLD, GREEN, RED, "#F97316", "#06B6D4"]
 
 PALETTE = [TEAL, BLUE, PURPLE, GOLD, GREEN, RED, "#F97316", "#06B6D4"]
 
@@ -41,6 +45,22 @@ LAYOUT_BASE = dict(
     hoverlabel=dict(bgcolor="#1E293B", bordercolor="rgba(255,255,255,0.15)",
                     font=dict(color="white", size=11)),
 )
+
+
+def build_client_maps(clients_df: pd.DataFrame):
+    """
+    Call this once after loading data to populate CLIENT_NAMES and CLIENT_COLORS
+    from the real client list — so charts always show actual names, never
+    hardcoded demo names like 'Alpha Retail'.
+    """
+    global CLIENT_NAMES, CLIENT_COLORS
+    CLIENT_NAMES  = {}
+    CLIENT_COLORS = {}
+    for i, (_, row) in enumerate(clients_df.iterrows()):
+        cid = row["client_id"]
+        CLIENT_NAMES[cid]  = row["client_name"]
+        CLIENT_COLORS[cid] = COLOR_CYCLE[i % len(COLOR_CYCLE)]
+
 
 def _fig(title=""):
     fig = go.Figure()
