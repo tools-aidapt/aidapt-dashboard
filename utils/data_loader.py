@@ -20,12 +20,20 @@ import os
 @st.cache_data(ttl=300, show_spinner="Loading data…")
 def load_all_data() -> dict:
     """Returns dict of DataFrames keyed by sheet/tab name."""
+    # Check if GOOGLE_SHEET_ID is set in secrets
     try:
-        sheet_id = st.secrets.get("GOOGLE_SHEET_ID", None)
-        if sheet_id:
+        sheet_id = st.secrets["GOOGLE_SHEET_ID"]
+    except (KeyError, FileNotFoundError):
+        sheet_id = None
+
+    if sheet_id:
+        try:
             return _load_from_sheets(sheet_id)
-    except Exception:
-        pass
+        except Exception as e:
+            st.error(f"Google Sheets connection failed: {e}")
+            st.warning("Check: (1) Sheet is saved as Google Sheets not .xlsx  (2) Sheet is shared with your service account email  (3) GOOGLE_SHEET_ID in secrets matches the actual Sheet URL")
+            st.stop()
+
     return _load_demo_data()
 
 
@@ -43,37 +51,73 @@ def _load_from_sheets(sheet_id: str) -> dict:
     gc      = gspread.authorize(creds)
     sh      = gc.open_by_key(sheet_id)
 
+    # Row 1 = banner, Row 2 = headers, Row 3+ = data
+    # tabs where row 3 is also a helper/note row (skip it too)
     tab_map = {
-        "CLIENTS":        "clients",
-        "KPI_DAILY":      "kpi_daily",
-        "KPI_MONTHLY":    "kpi_monthly",
-        "OPPORTUNITIES":  "opportunities",
-        "OPP_FINANCIALS": "opp_financials",
-        "SOLUTIONS":      "solutions",
-        "BASELINES":      "baselines",
+        "CLIENTS":        ("clients",       2, 3),
+        "KPI_DAILY":      ("kpi_daily",     2, 4),
+        "KPI_MONTHLY":    ("kpi_monthly",   2, 4),
+        "OPPORTUNITIES":  ("opportunities", 3, 4),
+        "OPP_FINANCIALS": ("opp_financials",3, 4),
+        "SOLUTIONS":      ("solutions",     2, 3),
+        "BASELINES":      ("baselines",     2, 3),
     }
     out = {}
-    for sheet_name, key in tab_map.items():
-        ws  = sh.worksheet(sheet_name)
-        df  = pd.DataFrame(ws.get_all_records())
+    for sheet_name, (key, header_row, data_start_row) in tab_map.items():
+        ws       = sh.worksheet(sheet_name)
+        all_vals = ws.get_all_values()
+        # Row index is 0-based in the list
+        headers  = all_vals[header_row - 1]
+        rows     = all_vals[data_start_row - 1:]
+        # Remove completely empty rows
+        rows = [r for r in rows if any(v.strip() for v in r)]
+        df   = pd.DataFrame(rows, columns=headers)
         out[key] = _clean_df(df, key)
     return out
 
 
 def _clean_df(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """
+    Convert all columns coming from Google Sheets (everything is string) into
+    correct types: dates → datetime, numbers → float/int, rest stays string.
+    """
     df = df.copy()
-    date_cols = {"kpi_daily": ["date"], "kpi_monthly": ["month"],
-                 "solutions": ["kickoff_date", "go_live_date"],
-                 "baselines": ["baseline_start", "baseline_end", "captured_at"]}
+
+    # ── Date columns ──────────────────────────────────────────────────────────
+    date_cols = {
+        "kpi_daily":  ["date"],
+        "kpi_monthly": ["month"],
+        "solutions":  ["kickoff_date", "go_live_date"],
+        "baselines":  ["baseline_start", "baseline_end", "captured_at"],
+    }
     for col in date_cols.get(key, []):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
-    num_cols = df.select_dtypes(include="object").columns
-    for col in num_cols:
-        try:
-            df[col] = pd.to_numeric(df[col].str.replace(",", "").str.replace("$", "").str.replace("%", ""), errors="ignore")
-        except Exception:
-            pass
+
+    # ── Numeric columns — try every object column ─────────────────────────────
+    for col in df.select_dtypes(include="object").columns:
+        # Clean common formatting characters from Sheets
+        cleaned = (
+            df[col]
+            .astype(str)
+            .str.strip()
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.replace("x", "", regex=False)   # e.g. "2.40x"
+            .str.replace("—", "", regex=False)   # em-dash placeholder
+            .str.replace("-", "", regex=False)   # formula fallback "-"
+            .str.replace(" ", "", regex=False)
+        )
+        # Only convert if the majority of non-empty values look numeric
+        # errors="coerce" means ANY malformed value (e.g. "13.67.6") → NaN, never crashes
+        numeric_attempt = pd.to_numeric(cleaned, errors="coerce")
+        non_null_orig   = df[col].replace(["", "—", "-", None], np.nan).dropna()
+        non_null_num    = numeric_attempt.dropna()
+        if len(non_null_orig) == 0 or len(non_null_num) / max(len(non_null_orig), 1) >= 0.7:
+            df[col] = numeric_attempt  # convert — mostly numeric, bad values become NaN
+        # else leave as string (e.g. opp_name, client_name etc.)
+
     return df
 
 
