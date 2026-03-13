@@ -1,29 +1,28 @@
 """
 Data loader — reads from Google Sheets (live) or falls back to demo data.
 Sheet schema matches KPI Mart v4:
-  Row 1 = banner title (ignored)
-  Row 2 = column headers
-  Row 3 = instructions (ignored)
-  Row 4+ = data
+  Row 1 = column headers
+  Row 2 = instructions (ignored)
+  Row 3+ = data
 """
-
+ 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-
+ 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-
-
+ 
+ 
 @st.cache_data(ttl=300)
 def load_all_data():
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-
+ 
         creds_dict = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         gc = gspread.authorize(creds)
@@ -45,21 +44,23 @@ def load_all_data():
     except Exception as e:
         st.warning(f"⚠️ Google Sheets connection failed: {e}. Showing demo data.")
         return _load_demo_data()
-
-
+ 
+ 
 def _read_tab(sheets, name):
     if name not in sheets:
         return pd.DataFrame()
     ws = sheets[name]
     rows = ws.get_all_values()
-    if len(rows) < 2:
+    if len(rows) < 1:
         return pd.DataFrame()
-
-    # Row 2 (index 1) = headers; row 3 (index 2) = instructions; data from row 4 (index 3)
-    headers = rows[1]
+ 
+    # Row 1 (index 0) = headers
+    # Row 2 (index 1) = instructions (skip)
+    # Row 3+ (index 2+) = data
+    headers = rows[0]
     if not any(h.strip() for h in headers):
         return pd.DataFrame()
-
+ 
     # Deduplicate headers
     seen = {}
     clean_headers = []
@@ -73,10 +74,10 @@ def _read_tab(sheets, name):
         else:
             seen[h] = 0
         clean_headers.append(h)
-
-    data_rows = rows[3:]  # skip banner (0), header (1), instructions (2)
+ 
+    data_rows = rows[2:]  # skip header (0), instructions (1)
     df = pd.DataFrame(data_rows, columns=clean_headers)
-
+ 
     # Drop marker / template rows
     df = df[df.iloc[:, 0].str.strip().ne("")]
     df = df[~df.iloc[:, 0].str.startswith("▼")]
@@ -84,8 +85,8 @@ def _read_tab(sheets, name):
     df = df.replace("", np.nan)
     df = _clean_df(df)
     return df
-
-
+ 
+ 
 def _clean_df(df):
     # Cast numeric columns
     for col in df.columns:
@@ -107,7 +108,7 @@ def _clean_df(df):
                        .str.replace(',', '', regex=False),
                 errors='coerce'
             )
-
+ 
     # Parse date/time columns
     for col in df.columns:
         if any(k in col.lower() for k in ['date', 'month', 'week', 'start', 'end', 'at']):
@@ -116,8 +117,8 @@ def _clean_df(df):
             except Exception:
                 pass
     return df
-
-
+ 
+ 
 def get_baseline(baselines: pd.DataFrame, client_id: str, kpi_name: str):
     """Return baseline value for a client+KPI, or None if not found."""
     if baselines is None or baselines.empty:
@@ -129,8 +130,8 @@ def get_baseline(baselines: pd.DataFrame, client_id: str, kpi_name: str):
     if row.empty:
         return None
     return pd.to_numeric(row.iloc[0]["baseline_value"], errors="coerce")
-
-
+ 
+ 
 def improvement_pct(current, baseline):
     try:
         current  = float(current)
@@ -140,13 +141,13 @@ def improvement_pct(current, baseline):
         return (current - baseline) / abs(baseline) * 100
     except Exception:
         return None
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEMO DATA — mirrors KPI Mart v4 exactly
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_demo_data():
-
+ 
     # ── CLIENTS ───────────────────────────────────────────────────────────────
     clients = pd.DataFrame([
         {"client_id": "C001", "client_name": "Kenafric Industries",
@@ -169,7 +170,7 @@ def _load_demo_data():
          "region": "Pakistan"},
     ])
     clients["go_live_date"] = pd.to_datetime(clients["go_live_date"])
-
+ 
     # ── OPPORTUNITIES ─────────────────────────────────────────────────────────
     opportunities = pd.DataFrame([
         {"client_id": "C001", "opp_id": "OPP-001", "opp_name": "Invoice Processing Automation",
@@ -218,7 +219,7 @@ def _load_demo_data():
          "priority_score": 7.8, "feasibility_score": 4, "value_score": 4,
          "initiative_status": "Pilot", "buy_build": "Buy", "hitl_level": "Full"},
     ])
-
+ 
     # ── OPP_FINANCIALS ────────────────────────────────────────────────────────
     opp_financials = pd.DataFrame([
         {"client_id":"C001","opp_id":"OPP-001","minutes_saved_per_unit":8,
@@ -276,16 +277,12 @@ def _load_demo_data():
          "annual_total_benefit":83200,"annual_total_cost":38667,
          "net_benefit":44533,"roi_multiple":3.44,"payback_months":16.7},
     ])
-
+ 
     # ── KPI_DAILY ─────────────────────────────────────────────────────────────
-    # mins_per_run per client (blended across live solutions):
-    #   C001 → 8 min  (Invoice Processing)
-    #   C002 → 22 min (blended: OPP-004=20, OPP-005=30 → avg ~22 for live solutions)
-    #   C003 → 20 min (blended: OPP-007=25, OPP-008=18 → avg ~20 for live solutions)
     mins_map = {"C001": 8, "C002": 22, "C003": 20}
     rows = []
-
-    # C001: 64 days from go-live 2026-01-06 (improving trend)
+ 
+    # C001: 64 days from go-live 2026-01-06
     for d in range(64):
         dt  = datetime.date(2026, 1, 6) + datetime.timedelta(days=d)
         ro  = 420 + d * 3 + (d % 7) * 12
@@ -303,7 +300,7 @@ def _load_demo_data():
                      "success_rate":round(ro / (ro + rf), 4),
                      "tickets_open":to_,"tickets_closed":tcl,
                      "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
-
+ 
     # C002: 38 days from go-live 2026-02-01
     for d in range(38):
         dt  = datetime.date(2026, 2, 1) + datetime.timedelta(days=d)
@@ -322,7 +319,7 @@ def _load_demo_data():
                      "success_rate":round(ro / (ro + rf), 4),
                      "tickets_open":to_,"tickets_closed":tcl,
                      "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
-
+ 
     # C003: 87 days from go-live 2025-12-15
     for d in range(87):
         dt  = datetime.date(2025, 12, 15) + datetime.timedelta(days=d)
@@ -341,10 +338,10 @@ def _load_demo_data():
                      "success_rate":round(ro / (ro + rf), 4),
                      "tickets_open":to_,"tickets_closed":tcl,
                      "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
-
+ 
     kpi_daily = pd.DataFrame(rows)
     kpi_daily["date"] = pd.to_datetime(kpi_daily["date"])
-
+ 
     # ── KPI_MONTHLY ───────────────────────────────────────────────────────────
     monthly_raw = [
         {"client_id":"C001","month":"2026-01","cost_savings_usd":18500,
@@ -370,8 +367,7 @@ def _load_demo_data():
     kpi_monthly["net_benefit_usd"]     = kpi_monthly["cost_savings_usd"] - kpi_monthly["delivery_cost_usd"]
     kpi_monthly["actual_roi_multiple"] = kpi_monthly["net_benefit_usd"] / kpi_monthly["delivery_cost_usd"]
     kpi_monthly["actual_vs_plan_pct"]  = kpi_monthly["actual_roi_multiple"] / kpi_monthly["planned_roi_multiple"]
-
-    # Derive hours_saved, runs, success_rate, avg_resolution from kpi_daily (mirrors SUMPRODUCT formulas)
+ 
     def _monthly_agg(cid, mo_str, daily_df):
         d = daily_df[
             (daily_df["client_id"] == cid) &
@@ -385,18 +381,18 @@ def _load_demo_data():
         sr   = runs / max(runs + fail, 1)
         res  = pd.to_numeric(d["avg_resolution_hrs"], errors="coerce").dropna()
         return hrs, runs, sr, res.mean() if len(res) > 0 else np.nan
-
+ 
     h_l, r_l, s_l, res_l = [], [], [], []
     for _, row in kpi_monthly.iterrows():
         h, r, s, res = _monthly_agg(row["client_id"], str(row["month"])[:7], kpi_daily)
         h_l.append(h); r_l.append(r); s_l.append(s); res_l.append(res)
-
+ 
     kpi_monthly["hours_saved"]                = h_l
     kpi_monthly["automation_runs_total"]      = r_l
     kpi_monthly["success_rate_monthly"]       = s_l
     kpi_monthly["avg_resolution_hrs_monthly"] = res_l
     kpi_monthly["month"] = pd.to_datetime(kpi_monthly["month"])
-
+ 
     # ── SOLUTIONS ─────────────────────────────────────────────────────────────
     solutions = pd.DataFrame([
         {"client_id":"C001","opp_id":"OPP-001",
@@ -429,7 +425,7 @@ def _load_demo_data():
          "fte_impacted":80,"version":"v0.9","notes":"SBP submission pilot"},
     ])
     solutions["go_live_date"] = pd.to_datetime(solutions["go_live_date"])
-
+ 
     # ── TICKET_SENTIMENT ──────────────────────────────────────────────────────
     import random
     random.seed(42)
@@ -454,10 +450,10 @@ def _load_demo_data():
             })
     ticket_sentiment = pd.DataFrame(ts_rows)
     ticket_sentiment["week_start"] = pd.to_datetime(ticket_sentiment["week_start"])
-
-    # ── BASELINES — exact values from KPI Mart v4 ─────────────────────────────
+ 
+    # ── BASELINES ─────────────────────────────────────────────────────────────
     baselines = pd.DataFrame([
-        # C001 Kenafric Industries (FMCG, baseline window: 25 Nov – 25 Dec 2025)
+        # C001 Kenafric Industries
         {"client_id":"C001","kpi_name":"automation_runs_success","baseline_value":0,
          "unit":"count","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
          "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Manual count",
@@ -494,7 +490,7 @@ def _load_demo_data():
          "unit":"%","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
          "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Finance audit",
          "notes":"Manual keying error rate"},
-        # C002 TCC Group (Telecom, baseline window: 2 Jan – 30 Jan 2026)
+        # C002 TCC Group
         {"client_id":"C002","kpi_name":"automation_runs_success","baseline_value":0,
          "unit":"count","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
          "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Manual count",
@@ -531,7 +527,7 @@ def _load_demo_data():
          "unit":"%","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
          "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"CRM system",
          "notes":"Monthly customer churn %"},
-        # C003 Bank Islami (Banking, baseline window: 15 Nov – 14 Dec 2025)
+        # C003 Bank Islami
         {"client_id":"C003","kpi_name":"automation_runs_success","baseline_value":0,
          "unit":"count","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
          "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Manual count",
@@ -575,7 +571,7 @@ def _load_demo_data():
     ])
     for col in ["baseline_start","baseline_end","captured_at"]:
         baselines[col] = pd.to_datetime(baselines[col])
-
+ 
     return {
         "clients":          clients,
         "opportunities":    opportunities,
