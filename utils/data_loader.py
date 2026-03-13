@@ -180,7 +180,9 @@ def _enrich_monthly(monthly: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
     def _needs_fill(col):
         if col not in monthly.columns:
             return True
-        return pd.to_numeric(monthly[col], errors="coerce").fillna(0).sum() == 0
+        vals = pd.to_numeric(monthly[col], errors="coerce")
+        # Fill if all values are zero or NaN
+        return vals.fillna(0).sum() == 0 or vals.isna().all()
 
     needs_hours = _needs_fill("hours_saved")
     needs_runs  = _needs_fill("automation_runs_total")
