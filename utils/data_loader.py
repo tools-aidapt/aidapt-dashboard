@@ -57,11 +57,33 @@ def _read_tab(sheets, name):
         return pd.DataFrame()
     ws = sheets[name]
     rows = ws.get_all_values()
-    if len(rows) < 1:
+    if len(rows) < 2:
         return pd.DataFrame()
 
-    # Row 1 (index 0) = headers
-    headers = rows[0]
+    # Auto-detect structure:
+    # Some tabs have: Row1=banner, Row2=headers, Row3=instructions, Row4+=data
+    # Some tabs have: Row1=headers, Row2=instructions, Row3+=data
+    # Detect by checking if row 1 contains known column names like "client_id"
+    KNOWN_HEADERS = {"client_id", "month", "date", "opp_id", "solution_name",
+                     "kpi_name", "week_start", "baseline_value"}
+
+    row0_cells = [c.strip().lower() for c in rows[0] if c.strip()]
+    row1_cells = [c.strip().lower() for c in rows[1] if c.strip()]
+
+    if any(c in KNOWN_HEADERS for c in row0_cells):
+        # Row 1 = headers, Row 2 = instructions, Row 3+ = data
+        header_idx = 0
+        data_start  = 2
+    elif any(c in KNOWN_HEADERS for c in row1_cells):
+        # Row 1 = banner, Row 2 = headers, Row 3 = instructions, Row 4+ = data
+        header_idx = 1
+        data_start  = 3
+    else:
+        # Fallback: try row 1 as headers, row 3+ as data
+        header_idx = 0
+        data_start  = 2
+
+    headers = rows[header_idx]
     if not any(h.strip() for h in headers):
         return pd.DataFrame()
 
@@ -79,32 +101,14 @@ def _read_tab(sheets, name):
             seen[h] = 0
         clean_headers.append(h)
 
-    # Auto-detect instruction row: if row 2 looks like placeholders, skip it
-    data_start = 1
-    if len(rows) > 1:
-        second_row = rows[1]
-        first_cell = second_row[0].strip() if second_row else ""
-        non_empty  = [c.strip() for c in second_row if c.strip()]
-        is_instruction = (
-            first_cell.endswith("...")
-            or first_cell in ("YYYY-MM-DD", "OPP-XXX", "C00X", "SOL-XXX", "kpi_name")
-            or (non_empty and all(
-                c.startswith("#") or c.startswith("$") or c.startswith("d×")
-                or c.startswith("f=") or c.startswith("f−") or "..." in c
-                or c in ("YYYY-MM-DD", "OPP-XXX", "C00X")
-                for c in non_empty
-            ))
-        )
-        if is_instruction:
-            data_start = 2
-
     data_rows = rows[data_start:]
     df = pd.DataFrame(data_rows, columns=clean_headers)
 
-    # Drop marker / template rows
+    # Drop marker / template / empty rows
     df = df[df.iloc[:, 0].str.strip().ne("")]
     df = df[~df.iloc[:, 0].str.startswith("▼")]
     df = df[~df.iloc[:, 0].str.startswith("C00X")]
+    df = df[~df.iloc[:, 0].str.contains(r"ADD NEW", na=False)]
     df = df.replace("", np.nan)
     df = _clean_df(df)
     return df
