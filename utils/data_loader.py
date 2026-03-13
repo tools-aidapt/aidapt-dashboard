@@ -1,358 +1,590 @@
 """
-Data Loader — reads from Google Sheets (live) or local Excel (fallback/demo).
-
-Priority:
-1. If GOOGLE_SHEET_ID is set in secrets/env → reads from Google Sheets via gspread
-2. Otherwise → reads from local demo_data.xlsx (bundled with the app)
-
-To connect live data:
-  - Set GOOGLE_SHEET_ID in .streamlit/secrets.toml
-  - Set GOOGLE_SERVICE_ACCOUNT JSON in .streamlit/secrets.toml
+Data loader — reads from Google Sheets (live) or falls back to demo data.
+Sheet schema matches KPI Mart v4:
+  Row 1 = banner title (ignored)
+  Row 2 = column headers
+  Row 3 = instructions (ignored)
+  Row 4+ = data
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
-import os
+import datetime
 
-# ── Cache: refresh every 5 minutes ────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner="Loading data…")
-def load_all_data() -> dict:
-    """Returns dict of DataFrames keyed by sheet/tab name."""
-    # Check if GOOGLE_SHEET_ID is set in secrets
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+
+@st.cache_data(ttl=300)
+def load_all_data():
     try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_dict = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        gc = gspread.authorize(creds)
         sheet_id = st.secrets["GOOGLE_SHEET_ID"]
-    except (KeyError, FileNotFoundError):
-        sheet_id = None
-
-    if sheet_id:
-        try:
-            return _load_from_sheets(sheet_id)
-        except Exception as e:
-            st.error(f"Google Sheets connection failed: {e}")
-            st.warning("Check: (1) Sheet is saved as Google Sheets not .xlsx  (2) Sheet is shared with your service account email  (3) GOOGLE_SHEET_ID in secrets matches the actual Sheet URL")
-            st.stop()
-
-    return _load_demo_data()
-
-
-def _load_from_sheets(sheet_id: str) -> dict:
-    """Load all tabs from a Google Sheet using a service account."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    sa_info = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
-    creds   = Credentials.from_service_account_info(sa_info, scopes=scopes)
-    gc      = gspread.authorize(creds)
-    sh      = gc.open_by_key(sheet_id)
-
-    # Row 1 = banner, Row 2 = headers, Row 3+ = data
-    # tabs where row 3 is also a helper/note row (skip it too)
-    tab_map = {
-        "CLIENTS":        ("clients",       2, 3),
-        "KPI_DAILY":      ("kpi_daily",     2, 4),
-        "KPI_MONTHLY":    ("kpi_monthly",   2, 4),
-        "OPPORTUNITIES":  ("opportunities", 3, 4),
-        "OPP_FINANCIALS": ("opp_financials",3, 4),
-        "SOLUTIONS":      ("solutions",     2, 3),
-        "BASELINES":      ("baselines",     2, 3),
-    }
-    out = {}
-    for sheet_name, (key, header_row, data_start_row) in tab_map.items():
-        ws       = sh.worksheet(sheet_name)
-        all_vals = ws.get_all_values()
-        # Row index is 0-based in the list
-        headers  = all_vals[header_row - 1]
-        rows     = all_vals[data_start_row - 1:]
-        # Remove completely empty rows
-        rows = [r for r in rows if any(v.strip() for v in r)]
-        df   = pd.DataFrame(rows, columns=headers)
-        out[key] = _clean_df(df, key)
-    return out
+        sh = gc.open_by_key(sheet_id)
+        sheets = {ws.title: ws for ws in sh.worksheets()}
+        return {
+            "clients":          _read_tab(sheets, "CLIENTS"),
+            "opportunities":    _read_tab(sheets, "OPPORTUNITIES"),
+            "opp_financials":   _read_tab(sheets, "OPP_FINANCIALS"),
+            "kpi_daily":        _read_tab(sheets, "KPI_DAILY"),
+            "kpi_monthly":      _read_tab(sheets, "KPI_MONTHLY"),
+            "solutions":        _read_tab(sheets, "SOLUTIONS"),
+            "ticket_sentiment": _read_tab(sheets, "TICKET_SENTIMENT"),
+            "baselines":        _read_tab(sheets, "BASELINES"),
+            "_source":    "live",
+            "_refreshed": datetime.datetime.now().strftime("%d %b %Y %H:%M"),
+        }
+    except Exception as e:
+        st.warning(f"⚠️ Google Sheets connection failed: {e}. Showing demo data.")
+        return _load_demo_data()
 
 
-def _clean_df(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    """
-    Convert all columns coming from Google Sheets (everything is string) into
-    correct types: dates → datetime, numbers → float/int, rest stays string.
-    """
-    df = df.copy()
+def _read_tab(sheets, name):
+    if name not in sheets:
+        return pd.DataFrame()
+    ws = sheets[name]
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return pd.DataFrame()
 
-    # ── Date columns ──────────────────────────────────────────────────────────
-    date_cols = {
-        "kpi_daily":  ["date"],
-        "kpi_monthly": ["month"],
-        "solutions":  ["kickoff_date", "go_live_date"],
-        "baselines":  ["baseline_start", "baseline_end", "captured_at"],
-    }
-    for col in date_cols.get(key, []):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+    # Row 2 (index 1) = headers; row 3 (index 2) = instructions; data from row 4 (index 3)
+    headers = rows[1]
+    if not any(h.strip() for h in headers):
+        return pd.DataFrame()
 
-    # ── Numeric columns — try every object column ─────────────────────────────
-    for col in df.select_dtypes(include="object").columns:
-        # Clean common formatting characters from Sheets
-        cleaned = (
-            df[col]
-            .astype(str)
-            .str.strip()
-            .str.replace(",", "", regex=False)
-            .str.replace("$", "", regex=False)
-            .str.replace("%", "", regex=False)
-            .str.replace("x", "", regex=False)   # e.g. "2.40x"
-            .str.replace("—", "", regex=False)   # em-dash placeholder
-            .str.replace("-", "", regex=False)   # formula fallback "-"
-            .str.replace(" ", "", regex=False)
-        )
-        # Only convert if the majority of non-empty values look numeric
-        # errors="coerce" means ANY malformed value (e.g. "13.67.6") → NaN, never crashes
-        numeric_attempt = pd.to_numeric(cleaned, errors="coerce")
-        non_null_orig   = df[col].replace(["", "—", "-", None], np.nan).dropna()
-        non_null_num    = numeric_attempt.dropna()
-        if len(non_null_orig) == 0 or len(non_null_num) / max(len(non_null_orig), 1) >= 0.7:
-            df[col] = numeric_attempt  # convert — mostly numeric, bad values become NaN
-        # else leave as string (e.g. opp_name, client_name etc.)
+    # Deduplicate headers
+    seen = {}
+    clean_headers = []
+    for h in headers:
+        h = h.strip()
+        if not h:
+            h = f"_col_{len(clean_headers)}"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 0
+        clean_headers.append(h)
 
+    data_rows = rows[3:]  # skip banner (0), header (1), instructions (2)
+    df = pd.DataFrame(data_rows, columns=clean_headers)
+
+    # Drop marker / template rows
+    df = df[df.iloc[:, 0].str.strip().ne("")]
+    df = df[~df.iloc[:, 0].str.startswith("▼")]
+    df = df[~df.iloc[:, 0].str.startswith("C00X")]
+    df = df.replace("", np.nan)
+    df = _clean_df(df)
     return df
 
 
-# ── Demo data (fully calculated, picture-perfect) ─────────────────────────────
-def _load_demo_data() -> dict:
-    """Generate realistic demo data matching KPI Mart v2 schema exactly."""
+def _clean_df(df):
+    # Cast numeric columns
+    for col in df.columns:
+        if col.startswith("_col_"):
+            continue
+        series = df[col].dropna()
+        if len(series) == 0:
+            continue
+        numeric = pd.to_numeric(
+            series.astype(str)
+                  .str.replace(r'[$,%x×]', '', regex=True)
+                  .str.replace(',', '', regex=False),
+            errors='coerce'
+        )
+        if numeric.notna().sum() / max(len(series), 1) >= 0.6:
+            df[col] = pd.to_numeric(
+                df[col].astype(str)
+                       .str.replace(r'[$,%x×]', '', regex=True)
+                       .str.replace(',', '', regex=False),
+                errors='coerce'
+            )
 
-    # ── CLIENTS ────────────────────────────────────────────────────────────────
+    # Parse date/time columns
+    for col in df.columns:
+        if any(k in col.lower() for k in ['date', 'month', 'week', 'start', 'end', 'at']):
+            try:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+            except Exception:
+                pass
+    return df
+
+
+def get_baseline(baselines: pd.DataFrame, client_id: str, kpi_name: str):
+    """Return baseline value for a client+KPI, or None if not found."""
+    if baselines is None or baselines.empty:
+        return None
+    row = baselines[
+        (baselines["client_id"] == client_id) &
+        (baselines["kpi_name"]  == kpi_name)
+    ]
+    if row.empty:
+        return None
+    return pd.to_numeric(row.iloc[0]["baseline_value"], errors="coerce")
+
+
+def improvement_pct(current, baseline):
+    try:
+        current  = float(current)
+        baseline = float(baseline)
+        if baseline == 0:
+            return None
+        return (current - baseline) / abs(baseline) * 100
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEMO DATA — mirrors KPI Mart v4 exactly
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_demo_data():
+
+    # ── CLIENTS ───────────────────────────────────────────────────────────────
     clients = pd.DataFrame([
-        {"client_id": "C001", "client_name": "Alpha Retail",
-         "client_type": "AI Transformation", "industry": "Retail",
-         "fte_count": 120, "annual_revenue_usd": 8_500_000,
-         "fte_hourly_rate_usd": 65, "status": "Active",
-         "start_date": "2026-01-06", "primary_contact_email": "alpha@example.com"},
-        {"client_id": "C002", "client_name": "Beta Logistics",
-         "client_type": "Data / Analytics", "industry": "Logistics",
-         "fte_count": 80, "annual_revenue_usd": 5_200_000,
-         "fte_hourly_rate_usd": 55, "status": "Active",
-         "start_date": "2026-01-20", "primary_contact_email": "beta@example.com"},
-        {"client_id": "C003", "client_name": "Gamma Finance",
-         "client_type": "Operations / Process", "industry": "Financial Services",
-         "fte_count": 200, "annual_revenue_usd": 15_000_000,
-         "fte_hourly_rate_usd": 75, "status": "Pilot",
-         "start_date": "2026-02-03", "primary_contact_email": "gamma@example.com"},
+        {"client_id": "C001", "client_name": "Kenafric Industries",
+         "client_type": "AI Transformation", "industry": "FMCG",
+         "go_live_date": "2026-01-06", "fte_count": 450,
+         "fte_hourly_rate_usd": 18.5, "status": "Active",
+         "contract_value_usd": 120000, "annual_revenue_usd": 85000000,
+         "region": "East Africa"},
+        {"client_id": "C002", "client_name": "TCC Group",
+         "client_type": "Data Analytics", "industry": "Telecommunications",
+         "go_live_date": "2026-02-01", "fte_count": 280,
+         "fte_hourly_rate_usd": 22.0, "status": "Active",
+         "contract_value_usd": 95000, "annual_revenue_usd": 210000000,
+         "region": "East Africa"},
+        {"client_id": "C003", "client_name": "Bank Islami",
+         "client_type": "AI Transformation", "industry": "Banking",
+         "go_live_date": "2025-12-15", "fte_count": 620,
+         "fte_hourly_rate_usd": 28.0, "status": "Active",
+         "contract_value_usd": 185000, "annual_revenue_usd": 520000000,
+         "region": "Pakistan"},
     ])
+    clients["go_live_date"] = pd.to_datetime(clients["go_live_date"])
 
-    # ── SOLUTIONS ──────────────────────────────────────────────────────────────
-    solutions = pd.DataFrame([
-        {"client_id": "C001", "solution_id": "S101", "solution_name": "AI Ticket Triage",
-         "kickoff_date": "2025-12-24", "go_live_date": "2026-01-18", "status": "Live", "time_to_go_live_days": 25},
-        {"client_id": "C001", "solution_id": "S102", "solution_name": "KB Auto-Tagging",
-         "kickoff_date": "2026-01-29", "go_live_date": "2026-02-10", "status": "Live", "time_to_go_live_days": 12},
-        {"client_id": "C002", "solution_id": "S201", "solution_name": "Shipment Exception Resolver",
-         "kickoff_date": "2026-01-18", "go_live_date": "2026-02-05", "status": "Live", "time_to_go_live_days": 18},
-        {"client_id": "C003", "solution_id": "S301", "solution_name": "Regulatory Doc Summariser",
-         "kickoff_date": "2026-01-21", "go_live_date": "2026-02-15", "status": "Live", "time_to_go_live_days": 25},
-    ])
-
-    # ── OPPORTUNITIES ──────────────────────────────────────────────────────────
+    # ── OPPORTUNITIES ─────────────────────────────────────────────────────────
     opportunities = pd.DataFrame([
-        {"client_id": "C001", "opp_id": "OPP-001", "opp_name": "AI Ticket Triage & Draft Response",
-         "function": "Support", "tier": "Tier 1", "ai_pattern": "Grounded Q&A (RAG)",
+        {"client_id": "C001", "opp_id": "OPP-001", "opp_name": "Invoice Processing Automation",
+         "function": "Finance", "ai_pattern": "Document AI",
          "value_type_primary": "Productivity", "value_type_secondary": "Quality",
-         "plan_classification": "Active Pilot", "initiative_status": "In Pilot",
-         "feasibility_score": 3.8, "value_score": 4.2, "priority_score": 4.0,
-         "risk_tier": "Medium", "buy_build": "Buy", "hitl_level": "Approve-to-send",
-         "pilot_candidate": "Yes", "primary_kpis": "TTFR, edit_rate, resolution_rate",
-         "notes": "Phase 1: 2 product lines"},
-        {"client_id": "C001", "opp_id": "OPP-002", "opp_name": "Smart KB Article Auto-Tagging",
-         "function": "Support", "tier": "Tier 2", "ai_pattern": "Classification",
-         "value_type_primary": "Quality", "value_type_secondary": "Productivity",
-         "plan_classification": "Backlog", "initiative_status": "Backlog",
-         "feasibility_score": 4.1, "value_score": 3.5, "priority_score": 3.8,
-         "risk_tier": "Low", "buy_build": "Buy", "hitl_level": "Auto-approve",
-         "pilot_candidate": "No", "primary_kpis": "kb_accuracy, search_time",
-         "notes": "Dependency: KB hygiene sprint first"},
-        {"client_id": "C002", "opp_id": "OPP-003", "opp_name": "Shipment Exception Auto-Resolution",
-         "function": "Operations", "tier": "Tier 1", "ai_pattern": "Workflow Automation",
-         "value_type_primary": "Productivity", "value_type_secondary": "OpEx Reduction",
-         "plan_classification": "Active Pilot", "initiative_status": "In Pilot",
-         "feasibility_score": 3.2, "value_score": 4.5, "priority_score": 3.9,
-         "risk_tier": "Medium", "buy_build": "Build", "hitl_level": "Human-in-loop",
-         "pilot_candidate": "Yes", "primary_kpis": "exceptions_resolved, handling_time",
-         "notes": "ERP integration required"},
-        {"client_id": "C002", "opp_id": "OPP-004", "opp_name": "Carrier Invoice Anomaly Detection",
-         "function": "Finance", "tier": "Tier 2", "ai_pattern": "Anomaly Detection",
-         "value_type_primary": "Quality", "value_type_secondary": "Revenue",
-         "plan_classification": "Backlog", "initiative_status": "Backlog",
-         "feasibility_score": 3.9, "value_score": 4.0, "priority_score": 3.95,
-         "risk_tier": "Low", "buy_build": "Buy", "hitl_level": "Approve-to-pay",
-         "pilot_candidate": "No", "primary_kpis": "invoice_error_rate, recovery_amt",
-         "notes": "SOX controls apply"},
-        {"client_id": "C003", "opp_id": "OPP-005", "opp_name": "Regulatory Document Summarisation",
-         "function": "Finance", "tier": "Tier 1", "ai_pattern": "Summarisation",
-         "value_type_primary": "Productivity", "value_type_secondary": "Compliance",
-         "plan_classification": "Live", "initiative_status": "Live",
-         "feasibility_score": 4.5, "value_score": 3.8, "priority_score": 4.15,
-         "risk_tier": "High", "buy_build": "Buy", "hitl_level": "Approve-to-send",
-         "pilot_candidate": "Yes", "primary_kpis": "docs_processed, time_saved",
-         "notes": "GDPR guardrails in place"},
+         "priority_score": 8.2, "feasibility_score": 4, "value_score": 4,
+         "initiative_status": "Live", "buy_build": "Buy", "hitl_level": "Partial"},
+        {"client_id": "C001", "opp_id": "OPP-002", "opp_name": "Demand Forecasting",
+         "function": "Supply Chain", "ai_pattern": "Predictive ML",
+         "value_type_primary": "Revenue", "value_type_secondary": "OpEx",
+         "priority_score": 7.5, "feasibility_score": 3, "value_score": 4,
+         "initiative_status": "Pilot", "buy_build": "Build", "hitl_level": "Full"},
+        {"client_id": "C001", "opp_id": "OPP-003", "opp_name": "HR Onboarding Automation",
+         "function": "HR", "ai_pattern": "RPA + GenAI",
+         "value_type_primary": "Productivity", "value_type_secondary": None,
+         "priority_score": 6.8, "feasibility_score": 4, "value_score": 3,
+         "initiative_status": "Backlog", "buy_build": "Build", "hitl_level": "Partial"},
+        {"client_id": "C002", "opp_id": "OPP-004", "opp_name": "Network Fault Prediction",
+         "function": "Operations", "ai_pattern": "Predictive ML",
+         "value_type_primary": "Quality", "value_type_secondary": "OpEx",
+         "priority_score": 8.8, "feasibility_score": 4, "value_score": 5,
+         "initiative_status": "Live", "buy_build": "Build", "hitl_level": "None"},
+        {"client_id": "C002", "opp_id": "OPP-005", "opp_name": "Customer Churn Prediction",
+         "function": "Commercial", "ai_pattern": "Predictive ML",
+         "value_type_primary": "Revenue", "value_type_secondary": "Quality",
+         "priority_score": 9.1, "feasibility_score": 4, "value_score": 5,
+         "initiative_status": "Live", "buy_build": "Build", "hitl_level": "Partial"},
+        {"client_id": "C002", "opp_id": "OPP-006", "opp_name": "Call Centre AI Assist",
+         "function": "Customer Service", "ai_pattern": "GenAI",
+         "value_type_primary": "Productivity", "value_type_secondary": "Quality",
+         "priority_score": 7.2, "feasibility_score": 3, "value_score": 4,
+         "initiative_status": "Pilot", "buy_build": "Buy", "hitl_level": "Full"},
+        {"client_id": "C003", "opp_id": "OPP-007", "opp_name": "AML Transaction Monitoring",
+         "function": "Compliance", "ai_pattern": "Predictive ML",
+         "value_type_primary": "Quality", "value_type_secondary": "OpEx",
+         "priority_score": 9.4, "feasibility_score": 5, "value_score": 5,
+         "initiative_status": "Live", "buy_build": "Build", "hitl_level": "Partial"},
+        {"client_id": "C003", "opp_id": "OPP-008", "opp_name": "Loan Application Processing",
+         "function": "Retail Banking", "ai_pattern": "Document AI",
+         "value_type_primary": "Productivity", "value_type_secondary": "Quality",
+         "priority_score": 8.5, "feasibility_score": 4, "value_score": 5,
+         "initiative_status": "Live", "buy_build": "Buy", "hitl_level": "Partial"},
+        {"client_id": "C003", "opp_id": "OPP-009", "opp_name": "Regulatory Reporting Auto",
+         "function": "Compliance", "ai_pattern": "RPA",
+         "value_type_primary": "OpEx", "value_type_secondary": "Quality",
+         "priority_score": 7.8, "feasibility_score": 4, "value_score": 4,
+         "initiative_status": "Pilot", "buy_build": "Buy", "hitl_level": "Full"},
     ])
 
-    # ── OPP_FINANCIALS (all calculated correctly) ──────────────────────────────
-    def calc_fin(mins_saved, vol, adoption, rate, quality_savings, impl_cost, license_cost, risk_haircut):
-        annual_prod  = (mins_saved * vol * adoption * rate) / 60
-        annual_qual  = quality_savings
-        total_benefit = annual_prod + annual_qual
-        total_cost    = impl_cost + license_cost
-        net           = (total_benefit - total_cost) * (1 - risk_haircut)
-        roi_mult      = round(net / total_cost, 2) if total_cost > 0 else 0
-        payback       = round((impl_cost / max(net / 12, 1)), 1)
-        gross_3yr     = total_benefit * 3
-        net_3yr       = (total_benefit * 3) - (impl_cost + license_cost * 3)
-        hours_saved   = (mins_saved * vol * adoption) / 60
-        return {
-            "annual_productivity_benefit": round(annual_prod),
-            "annual_quality_benefit":      round(annual_qual),
-            "annual_total_benefit":        round(total_benefit),
-            "annual_total_cost":           round(total_cost),
-            "net_benefit_risk_adj":        round(net),
-            "roi_multiple_annual":         roi_mult,
-            "payback_months":              payback,
-            "gross_3yr_usd":               round(gross_3yr),
-            "net_3yr_usd":                 round(net_3yr),
-            "hours_saved_annual":          round(hours_saved),
-        }
+    # ── OPP_FINANCIALS ────────────────────────────────────────────────────────
+    opp_financials = pd.DataFrame([
+        {"client_id":"C001","opp_id":"OPP-001","minutes_saved_per_unit":8,
+         "annual_volume":12000,"adoption_pct":0.85,"fully_loaded_cost_per_hr":18.5,
+         "quality_savings":5000,"impl_cost":45000,"annual_license_cost":12000,
+         "risk_haircut_pct":0.15,"annual_productivity_benefit":25160,
+         "annual_total_benefit":25636,"annual_total_cost":27000,
+         "net_benefit":-1364,"roi_multiple":-0.09,"payback_months":999},
+        {"client_id":"C001","opp_id":"OPP-002","minutes_saved_per_unit":15,
+         "annual_volume":3600,"adoption_pct":0.70,"fully_loaded_cost_per_hr":18.5,
+         "quality_savings":18000,"impl_cost":80000,"annual_license_cost":24000,
+         "risk_haircut_pct":0.25,"annual_productivity_benefit":32813,
+         "annual_total_benefit":41259,"annual_total_cost":50667,
+         "net_benefit":-9408,"roi_multiple":-0.56,"payback_months":999},
+        {"client_id":"C001","opp_id":"OPP-003","minutes_saved_per_unit":12,
+         "annual_volume":2400,"adoption_pct":0.80,"fully_loaded_cost_per_hr":18.5,
+         "quality_savings":3000,"impl_cost":35000,"annual_license_cost":8000,
+         "risk_haircut_pct":0.15,"annual_productivity_benefit":23808,
+         "annual_total_benefit":23186,"annual_total_cost":19667,
+         "net_benefit":3520,"roi_multiple":0.48,"payback_months":99.4},
+        {"client_id":"C002","opp_id":"OPP-004","minutes_saved_per_unit":20,
+         "annual_volume":18000,"adoption_pct":0.90,"fully_loaded_cost_per_hr":22.0,
+         "quality_savings":25000,"impl_cost":95000,"annual_license_cost":28000,
+         "risk_haircut_pct":0.15,"annual_productivity_benefit":118800,
+         "annual_total_benefit":122580,"annual_total_cost":59667,
+         "net_benefit":62913,"roi_multiple":1.99,"payback_months":18.1},
+        {"client_id":"C002","opp_id":"OPP-005","minutes_saved_per_unit":30,
+         "annual_volume":9600,"adoption_pct":0.85,"fully_loaded_cost_per_hr":22.0,
+         "quality_savings":55000,"impl_cost":120000,"annual_license_cost":36000,
+         "risk_haircut_pct":0.20,"annual_productivity_benefit":94080,
+         "annual_total_benefit":119264,"annual_total_cost":76000,
+         "net_benefit":43264,"roi_multiple":1.08,"payback_months":33.3},
+        {"client_id":"C002","opp_id":"OPP-006","minutes_saved_per_unit":10,
+         "annual_volume":24000,"adoption_pct":0.75,"fully_loaded_cost_per_hr":22.0,
+         "quality_savings":8000,"impl_cost":55000,"annual_license_cost":18000,
+         "risk_haircut_pct":0.20,"annual_productivity_benefit":66000,
+         "annual_total_benefit":59200,"annual_total_cost":36333,
+         "net_benefit":22867,"roi_multiple":1.89,"payback_months":28.9},
+        {"client_id":"C003","opp_id":"OPP-007","minutes_saved_per_unit":25,
+         "annual_volume":36000,"adoption_pct":0.92,"fully_loaded_cost_per_hr":28.0,
+         "quality_savings":85000,"impl_cost":145000,"annual_license_cost":42000,
+         "risk_haircut_pct":0.15,"annual_productivity_benefit":386400,
+         "annual_total_benefit":399348,"annual_total_cost":90333,
+         "net_benefit":309015,"roi_multiple":6.42,"payback_months":5.6},
+        {"client_id":"C003","opp_id":"OPP-008","minutes_saved_per_unit":18,
+         "annual_volume":21600,"adoption_pct":0.88,"fully_loaded_cost_per_hr":28.0,
+         "quality_savings":35000,"impl_cost":85000,"annual_license_cost":25000,
+         "risk_haircut_pct":0.15,"annual_productivity_benefit":180288,
+         "annual_total_benefit":183745,"annual_total_cost":53333,
+         "net_benefit":130412,"roi_multiple":4.60,"payback_months":7.8},
+        {"client_id":"C003","opp_id":"OPP-009","minutes_saved_per_unit":12,
+         "annual_volume":12000,"adoption_pct":0.80,"fully_loaded_cost_per_hr":28.0,
+         "quality_savings":15000,"impl_cost":62000,"annual_license_cost":18000,
+         "risk_haircut_pct":0.20,"annual_productivity_benefit":89600,
+         "annual_total_benefit":83200,"annual_total_cost":38667,
+         "net_benefit":44533,"roi_multiple":3.44,"payback_months":16.7},
+    ])
 
-    fin_inputs = {
-        "OPP-001": (5,  24000, 0.75, 65, 15000, 45000, 18000, 0.20),
-        "OPP-002": (3,  18000, 0.60, 65,  8000, 12000,  6000, 0.25),
-        "OPP-003": (12,  8000, 0.80, 55, 22000, 80000, 24000, 0.15),
-        "OPP-004": (8,   5000, 0.70, 55, 35000, 25000, 12000, 0.20),
-        "OPP-005": (25,  3000, 0.90, 75,  5000, 30000, 15000, 0.10),
-    }
-    fin_rows = []
-    for opp_id, (mins, vol, adp, rate, qual, impl, lic, risk) in fin_inputs.items():
-        c_id = opp_id[:5].replace("PP-0", "00").replace("OPP", "")
-        cmap = {"OPP-001": "C001","OPP-002":"C001","OPP-003":"C002","OPP-004":"C002","OPP-005":"C003"}
-        row = {"client_id": cmap[opp_id], "opp_id": opp_id,
-               "minutes_saved_per_unit": mins, "annual_volume_units": vol,
-               "adoption_pct": adp, "fully_loaded_cost_usd_hr": rate,
-               "quality_savings_usd_yr": qual, "impl_cost_usd": impl,
-               "annual_license_cost_usd": lic, "risk_haircut_pct": risk}
-        row.update(calc_fin(mins, vol, adp, rate, qual, impl, lic, risk))
-        fin_rows.append(row)
-    opp_financials = pd.DataFrame(fin_rows)
+    # ── KPI_DAILY ─────────────────────────────────────────────────────────────
+    # mins_per_run per client (blended across live solutions):
+    #   C001 → 8 min  (Invoice Processing)
+    #   C002 → 22 min (blended: OPP-004=20, OPP-005=30 → avg ~22 for live solutions)
+    #   C003 → 20 min (blended: OPP-007=25, OPP-008=18 → avg ~20 for live solutions)
+    mins_map = {"C001": 8, "C002": 22, "C003": 20}
+    rows = []
 
-    # ── KPI_DAILY (90 days, 3 clients, realistic ramp-up) ─────────────────────
-    daily_rows = []
-    start = date(2025, 12, 21)
-    go_live = {"C001": date(2026, 1, 18), "C002": date(2026, 2, 5), "C003": date(2026, 2, 15)}
-    sol2_live = {"C001": date(2026, 2, 10)}
-    rng = np.random.default_rng(42)
+    # C001: 64 days from go-live 2026-01-06 (improving trend)
+    for d in range(64):
+        dt  = datetime.date(2026, 1, 6) + datetime.timedelta(days=d)
+        ro  = 420 + d * 3 + (d % 7) * 12
+        rf  = max(0, 18 - d // 5)
+        tc  = max(1, 8 - d // 10)
+        to_ = max(2, 12 - d // 8)
+        tcl = min(tc + 1, 6 + d // 12)
+        rh  = round(max(14.5, 52.0 - d * 0.587), 1)
+        hp  = max(0, 3 - d // 15)
+        rows.append({"client_id":"C001","date":dt,"solutions_deployed":2,
+                     "automation_runs_success":ro,"automation_runs_failed":rf,
+                     "support_tickets_created":tc,
+                     "hours_saved":round(ro * mins_map["C001"] / 60, 2),
+                     "tickets_per_100_runs":round(tc / ro * 100, 2),
+                     "success_rate":round(ro / (ro + rf), 4),
+                     "tickets_open":to_,"tickets_closed":tcl,
+                     "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
 
-    for cid in ["C001", "C002", "C003"]:
-        gl = go_live[cid]
-        for d in (start + timedelta(n) for n in range(73)):
-            if d > date(2026, 3, 3):
-                break
-            days_live = max(0, (d - gl).days)
-            if days_live == 0:
-                runs_s, runs_f, tickets = 0, 0, 0
-            else:
-                # Ramp: 0→full over 14 days, then steady with noise
-                base = {"C001": 420, "C002": 160, "C003": 95}[cid]
-                ramp = min(1.0, days_live / 14)
-                # Sol2 adds volume for C001
-                if cid == "C001" and d >= sol2_live.get("C001", date(2099,1,1)):
-                    base += 180
-                runs_s = max(0, int(base * ramp * rng.normal(1.0, 0.05)))
-                fail_rate = 0.038
-                runs_f  = max(0, int(runs_s * fail_rate * rng.normal(1.0, 0.2)))
-                ticket_base = {"C001": 3, "C002": 2, "C003": 1}[cid]
-                tickets = max(0, int(ticket_base * rng.normal(1.0, 0.3)))
+    # C002: 38 days from go-live 2026-02-01
+    for d in range(38):
+        dt  = datetime.date(2026, 2, 1) + datetime.timedelta(days=d)
+        ro  = 680 + d * 8 + (d % 5) * 20
+        rf  = max(0, 22 - d // 4)
+        tc  = max(1, 10 - d // 8)
+        to_ = max(3, 15 - d // 7)
+        tcl = min(tc + 2, 8 + d // 10)
+        rh  = round(max(22.4, 68.0 - d * 1.20), 1)
+        hp  = max(0, 4 - d // 10)
+        rows.append({"client_id":"C002","date":dt,"solutions_deployed":2,
+                     "automation_runs_success":ro,"automation_runs_failed":rf,
+                     "support_tickets_created":tc,
+                     "hours_saved":round(ro * mins_map["C002"] / 60, 2),
+                     "tickets_per_100_runs":round(tc / ro * 100, 2),
+                     "success_rate":round(ro / (ro + rf), 4),
+                     "tickets_open":to_,"tickets_closed":tcl,
+                     "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
 
-            total_runs = runs_s + runs_f
-            tpr = round((tickets / total_runs * 100), 2) if total_runs > 0 else 0.0
-            sr  = round(runs_s / total_runs, 4) if total_runs > 0 else 0.0
-            mins_per_run = {"C001": 5, "C002": 12, "C003": 25}[cid]
-            hours_saved  = round(runs_s * mins_per_run / 60, 2)
-            daily_rows.append({
-                "client_id": cid, "date": pd.Timestamp(d),
-                "solutions_deployed": 1 if d >= gl else 0,
-                "automation_runs_success": runs_s, "automation_runs_failed": runs_f,
-                "support_tickets_created": tickets, "tickets_per_100_runs": tpr,
-                "success_rate": sr, "hours_saved": hours_saved, "notes": None,
+    # C003: 87 days from go-live 2025-12-15
+    for d in range(87):
+        dt  = datetime.date(2025, 12, 15) + datetime.timedelta(days=d)
+        ro  = 890 + d * 5 + (d % 6) * 18
+        rf  = max(0, 25 - d // 6)
+        tc  = max(3, 12 - d // 12)
+        to_ = max(8, 22 - d // 7)
+        tcl = min(tc + 2, 9 + d // 11)
+        rh  = round(max(11.0, 74.0 - d * 0.724), 1)
+        hp  = max(0, 5 - d // 15)
+        rows.append({"client_id":"C003","date":dt,"solutions_deployed":3,
+                     "automation_runs_success":ro,"automation_runs_failed":rf,
+                     "support_tickets_created":tc,
+                     "hours_saved":round(ro * mins_map["C003"] / 60, 2),
+                     "tickets_per_100_runs":round(tc / ro * 100, 2),
+                     "success_rate":round(ro / (ro + rf), 4),
+                     "tickets_open":to_,"tickets_closed":tcl,
+                     "avg_resolution_hrs":rh,"high_priority_count":hp,"notes":""})
+
+    kpi_daily = pd.DataFrame(rows)
+    kpi_daily["date"] = pd.to_datetime(kpi_daily["date"])
+
+    # ── KPI_MONTHLY ───────────────────────────────────────────────────────────
+    monthly_raw = [
+        {"client_id":"C001","month":"2026-01","cost_savings_usd":18500,
+         "delivery_cost_usd":8200,"planned_roi_multiple":2.5},
+        {"client_id":"C001","month":"2026-02","cost_savings_usd":24800,
+         "delivery_cost_usd":8200,"planned_roi_multiple":2.5},
+        {"client_id":"C001","month":"2026-03","cost_savings_usd":28200,
+         "delivery_cost_usd":8200,"planned_roi_multiple":2.5},
+        {"client_id":"C002","month":"2026-02","cost_savings_usd":32000,
+         "delivery_cost_usd":11500,"planned_roi_multiple":3.2},
+        {"client_id":"C002","month":"2026-03","cost_savings_usd":41500,
+         "delivery_cost_usd":11500,"planned_roi_multiple":3.2},
+        {"client_id":"C003","month":"2025-12","cost_savings_usd":42000,
+         "delivery_cost_usd":18000,"planned_roi_multiple":4.1},
+        {"client_id":"C003","month":"2026-01","cost_savings_usd":55000,
+         "delivery_cost_usd":18000,"planned_roi_multiple":4.1},
+        {"client_id":"C003","month":"2026-02","cost_savings_usd":68000,
+         "delivery_cost_usd":18000,"planned_roi_multiple":4.1},
+        {"client_id":"C003","month":"2026-03","cost_savings_usd":71000,
+         "delivery_cost_usd":18000,"planned_roi_multiple":4.1},
+    ]
+    kpi_monthly = pd.DataFrame(monthly_raw)
+    kpi_monthly["net_benefit_usd"]     = kpi_monthly["cost_savings_usd"] - kpi_monthly["delivery_cost_usd"]
+    kpi_monthly["actual_roi_multiple"] = kpi_monthly["net_benefit_usd"] / kpi_monthly["delivery_cost_usd"]
+    kpi_monthly["actual_vs_plan_pct"]  = kpi_monthly["actual_roi_multiple"] / kpi_monthly["planned_roi_multiple"]
+
+    # Derive hours_saved, runs, success_rate, avg_resolution from kpi_daily (mirrors SUMPRODUCT formulas)
+    def _monthly_agg(cid, mo_str, daily_df):
+        d = daily_df[
+            (daily_df["client_id"] == cid) &
+            (daily_df["date"].dt.strftime("%Y-%m") == mo_str)
+        ]
+        if d.empty:
+            return 0, 0, np.nan, np.nan
+        hrs  = d["hours_saved"].sum()
+        runs = d["automation_runs_success"].sum()
+        fail = d["automation_runs_failed"].sum()
+        sr   = runs / max(runs + fail, 1)
+        res  = pd.to_numeric(d["avg_resolution_hrs"], errors="coerce").dropna()
+        return hrs, runs, sr, res.mean() if len(res) > 0 else np.nan
+
+    h_l, r_l, s_l, res_l = [], [], [], []
+    for _, row in kpi_monthly.iterrows():
+        h, r, s, res = _monthly_agg(row["client_id"], str(row["month"])[:7], kpi_daily)
+        h_l.append(h); r_l.append(r); s_l.append(s); res_l.append(res)
+
+    kpi_monthly["hours_saved"]                = h_l
+    kpi_monthly["automation_runs_total"]      = r_l
+    kpi_monthly["success_rate_monthly"]       = s_l
+    kpi_monthly["avg_resolution_hrs_monthly"] = res_l
+    kpi_monthly["month"] = pd.to_datetime(kpi_monthly["month"])
+
+    # ── SOLUTIONS ─────────────────────────────────────────────────────────────
+    solutions = pd.DataFrame([
+        {"client_id":"C001","opp_id":"OPP-001",
+         "solution_name":"Invoice Intelligence Platform","solution_type":"Document AI",
+         "go_live_date":"2026-01-06","phase":"Live",
+         "fte_impacted":85,"version":"v1.2","notes":"Processing 400+ invoices/day"},
+        {"client_id":"C001","opp_id":"OPP-002",
+         "solution_name":"Demand Signal Engine","solution_type":"Predictive ML",
+         "go_live_date":"2026-02-15","phase":"Pilot",
+         "fte_impacted":40,"version":"v0.8","notes":"3-month pilot, go-live Q2"},
+        {"client_id":"C002","opp_id":"OPP-004",
+         "solution_name":"NetGuard Fault Predictor","solution_type":"Predictive ML",
+         "go_live_date":"2026-02-01","phase":"Live",
+         "fte_impacted":120,"version":"v1.0","notes":"Covering all 12 network zones"},
+        {"client_id":"C002","opp_id":"OPP-005",
+         "solution_name":"ChurnShield Analytics","solution_type":"Predictive ML",
+         "go_live_date":"2026-02-01","phase":"Live",
+         "fte_impacted":65,"version":"v1.1","notes":"Integrated with CRM"},
+        {"client_id":"C003","opp_id":"OPP-007",
+         "solution_name":"AML Sentinel","solution_type":"Predictive ML",
+         "go_live_date":"2025-12-15","phase":"Live",
+         "fte_impacted":200,"version":"v2.0","notes":"Regulatory approved"},
+        {"client_id":"C003","opp_id":"OPP-008",
+         "solution_name":"LoanFlow Automation","solution_type":"Document AI",
+         "go_live_date":"2025-12-15","phase":"Live",
+         "fte_impacted":150,"version":"v1.3","notes":"Handles retail + SME loans"},
+        {"client_id":"C003","opp_id":"OPP-009",
+         "solution_name":"RegReport Auto","solution_type":"RPA",
+         "go_live_date":"2026-01-15","phase":"Pilot",
+         "fte_impacted":80,"version":"v0.9","notes":"SBP submission pilot"},
+    ])
+    solutions["go_live_date"] = pd.to_datetime(solutions["go_live_date"])
+
+    # ── TICKET_SENTIMENT ──────────────────────────────────────────────────────
+    import random
+    random.seed(42)
+    ts_rows = []
+    configs = [
+        ("C001", datetime.date(2026, 1,  5), 5, 3),
+        ("C002", datetime.date(2026, 2,  2), 6, 3),
+        ("C003", datetime.date(2025,12, 15), 4, 6),
+    ]
+    for cid, wk_base, neg_start, pos_start in configs:
+        for w in range(10):
+            wk  = wk_base + datetime.timedelta(weeks=w)
+            neg = max(0, neg_start - w // 2 + random.randint(-1, 1))
+            pos = min(12, pos_start + w // 2 + random.randint(0, 2))
+            neu = random.randint(2, 5)
+            total = pos + neu + neg
+            ts_rows.append({
+                "client_id": cid, "week_start": wk,
+                "positive_count": pos, "neutral_count": neu, "negative_count": neg,
+                "total_tickets": total,
+                "sentiment_score": round((pos - neg) / max(1, total), 3),
             })
-    kpi_daily = pd.DataFrame(daily_rows)
+    ticket_sentiment = pd.DataFrame(ts_rows)
+    ticket_sentiment["week_start"] = pd.to_datetime(ticket_sentiment["week_start"])
 
-    # ── KPI_MONTHLY (calculated from daily + financial model) ─────────────────
-    # Hourly rates per client
-    hrly = {"C001": 65, "C002": 55, "C003": 75}
-    delivery_cost = {"C001": {"2026-01": 18000, "2026-02": 14400, "2026-03": 12000},
-                     "C002": {"2026-01": 14000, "2026-02": 11200, "2026-03": 10000},
-                     "C003": {"2026-01":     0, "2026-02":  7200, "2026-03":  6000}}
-    rev_gen = {"C001": {"2026-01": 0, "2026-02": 12000, "2026-03": 18000},
-               "C002": {"2026-01": 0, "2026-02":     0, "2026-03":  5000},
-               "C003": {"2026-01": 0, "2026-02":     0, "2026-03":  2000}}
-
-    monthly_rows = []
-    kpi_daily["month_str"] = kpi_daily["date"].dt.strftime("%Y-%m")
-    for cid in ["C001","C002","C003"]:
-        for mon_str in ["2025-12","2026-01","2026-02","2026-03"]:
-            sub = kpi_daily[(kpi_daily["client_id"]==cid) & (kpi_daily["month_str"]==mon_str)]
-            hs  = round(sub["hours_saved"].sum(), 1)
-            savings = round(hs * hrly[cid])
-            dc   = delivery_cost.get(cid, {}).get(mon_str, 0)
-            rg   = rev_gen.get(cid, {}).get(mon_str, 0)
-            total_val = savings + rg
-            roi = round((total_val - dc) / dc, 4) if dc > 0 else None
-            runs_total = sub["automation_runs_success"].sum() + sub["automation_runs_failed"].sum()
-            eff = round(sub["hours_saved"].sum() / max(1, sub["automation_runs_success"].sum() + 0.01) * 100 / 25, 4)
-            # avg time to go live
-            sol_sub = solutions[(solutions["client_id"]==cid)]
-            avg_ttgl = sol_sub["time_to_go_live_days"].mean() if not sol_sub.empty else None
-
-            # planned roi (from financials)
-            fin_sub = opp_financials[opp_financials["client_id"]==cid]
-            planned_roi = fin_sub["roi_multiple_annual"].mean() if not fin_sub.empty else None
-
-            net_benefit = round(total_val - dc)
-
-            monthly_rows.append({
-                "client_id": cid, "month": pd.Timestamp(mon_str + "-01"),
-                "hours_saved": hs, "cost_savings": savings,
-                "revenue_generated": rg, "delivery_cost": dc,
-                "roi_percent": roi, "efficiency_improvement_percent": round(eff, 4),
-                "avg_time_to_go_live_days": avg_ttgl,
-                "planned_roi_multiple": planned_roi,
-                "actual_vs_plan_roi_pct": round((roi - planned_roi) / abs(planned_roi) * 100, 1) if (roi and planned_roi) else None,
-                "net_benefit_ytd": net_benefit,
-                "notes": None,
-            })
-    kpi_monthly = pd.DataFrame(monthly_rows)
-
-    # ── BASELINES ──────────────────────────────────────────────────────────────
+    # ── BASELINES — exact values from KPI Mart v4 ─────────────────────────────
     baselines = pd.DataFrame([
-        {"client_id": "C001", "kpi_name": "automation_runs_success", "baseline_value": 40,
-         "baseline_start": "2025-12-09", "baseline_end": "2026-01-05", "captured_at": "2026-01-06", "notes": "Pre go-live"},
-        {"client_id": "C001", "kpi_name": "support_tickets_created", "baseline_value": 6,
-         "baseline_start": "2025-12-09", "baseline_end": "2026-01-05", "captured_at": "2026-01-06", "notes": ""},
-        {"client_id": "C001", "kpi_name": "cost_savings", "baseline_value": 0,
-         "baseline_start": "2025-12-09", "baseline_end": "2026-01-05", "captured_at": "2026-01-06", "notes": ""},
-        {"client_id": "C002", "kpi_name": "automation_runs_success", "baseline_value": 25,
-         "baseline_start": "2025-12-23", "baseline_end": "2026-01-19", "captured_at": "2026-01-20", "notes": ""},
-        {"client_id": "C003", "kpi_name": "automation_runs_success", "baseline_value": 10,
-         "baseline_start": "2026-01-01", "baseline_end": "2026-02-14", "captured_at": "2026-02-15", "notes": ""},
+        # C001 Kenafric Industries (FMCG, baseline window: 25 Nov – 25 Dec 2025)
+        {"client_id":"C001","kpi_name":"automation_runs_success","baseline_value":0,
+         "unit":"count","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Manual count",
+         "notes":"No automation existed pre go-live"},
+        {"client_id":"C001","kpi_name":"hours_saved","baseline_value":0,
+         "unit":"hours","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Calculated",
+         "notes":"Zero automation = zero hours saved"},
+        {"client_id":"C001","kpi_name":"support_tickets_created","baseline_value":9.2,
+         "unit":"count/day","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Daily avg over 4-week baseline period"},
+        {"client_id":"C001","kpi_name":"tickets_open","baseline_value":18,
+         "unit":"count","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Avg open ticket backlog at EOD"},
+        {"client_id":"C001","kpi_name":"avg_resolution_hrs","baseline_value":52,
+         "unit":"hours","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Zoho Desk report",
+         "notes":"Avg hrs from ticket creation to close"},
+        {"client_id":"C001","kpi_name":"high_priority_count","baseline_value":4.5,
+         "unit":"count/day","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Daily avg High/Urgent tickets"},
+        {"client_id":"C001","kpi_name":"cost_savings_usd","baseline_value":0,
+         "unit":"$/month","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Finance",
+         "notes":"No AI savings before go-live"},
+        {"client_id":"C001","kpi_name":"invoice_processing_time_hrs","baseline_value":6.5,
+         "unit":"hours","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"ERP system",
+         "notes":"Avg manual invoice processing time"},
+        {"client_id":"C001","kpi_name":"invoice_error_rate_pct","baseline_value":8.2,
+         "unit":"%","baseline_start":"2025-11-25","baseline_end":"2025-12-25",
+         "captured_at":"2026-01-05","captured_by":"Aidapt AM","data_source":"Finance audit",
+         "notes":"Manual keying error rate"},
+        # C002 TCC Group (Telecom, baseline window: 2 Jan – 30 Jan 2026)
+        {"client_id":"C002","kpi_name":"automation_runs_success","baseline_value":0,
+         "unit":"count","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Manual count",
+         "notes":"No automation existed pre go-live"},
+        {"client_id":"C002","kpi_name":"hours_saved","baseline_value":0,
+         "unit":"hours","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Calculated",
+         "notes":"Zero automation = zero hours saved"},
+        {"client_id":"C002","kpi_name":"support_tickets_created","baseline_value":13.8,
+         "unit":"count/day","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Daily avg incl. network fault tickets"},
+        {"client_id":"C002","kpi_name":"tickets_open","baseline_value":22,
+         "unit":"count","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Higher backlog due to manual fault diagnosis"},
+        {"client_id":"C002","kpi_name":"avg_resolution_hrs","baseline_value":68,
+         "unit":"hours","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Zoho Desk report",
+         "notes":"Manual fault diagnosis very slow"},
+        {"client_id":"C002","kpi_name":"high_priority_count","baseline_value":6.2,
+         "unit":"count/day","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Network faults often P1"},
+        {"client_id":"C002","kpi_name":"cost_savings_usd","baseline_value":0,
+         "unit":"$/month","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"Finance",
+         "notes":"No AI savings before go-live"},
+        {"client_id":"C002","kpi_name":"network_fault_mttr_hrs","baseline_value":14.2,
+         "unit":"hours","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"NOC system",
+         "notes":"Mean time to repair network faults"},
+        {"client_id":"C002","kpi_name":"churn_rate_monthly_pct","baseline_value":2.8,
+         "unit":"%","baseline_start":"2026-01-02","baseline_end":"2026-01-30",
+         "captured_at":"2026-01-31","captured_by":"Aidapt AM","data_source":"CRM system",
+         "notes":"Monthly customer churn %"},
+        # C003 Bank Islami (Banking, baseline window: 15 Nov – 14 Dec 2025)
+        {"client_id":"C003","kpi_name":"automation_runs_success","baseline_value":0,
+         "unit":"count","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Manual count",
+         "notes":"No automation existed pre go-live"},
+        {"client_id":"C003","kpi_name":"hours_saved","baseline_value":0,
+         "unit":"hours","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Calculated",
+         "notes":"Zero automation = zero hours saved"},
+        {"client_id":"C003","kpi_name":"support_tickets_created","baseline_value":16.5,
+         "unit":"count/day","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"High ticket volume from manual compliance checks"},
+        {"client_id":"C003","kpi_name":"tickets_open","baseline_value":28,
+         "unit":"count","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Large backlog before AI"},
+        {"client_id":"C003","kpi_name":"avg_resolution_hrs","baseline_value":74,
+         "unit":"hours","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Zoho Desk report",
+         "notes":"Complex banking tickets take time"},
+        {"client_id":"C003","kpi_name":"high_priority_count","baseline_value":7.8,
+         "unit":"count/day","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Zoho Desk export",
+         "notes":"Compliance and AML alerts drive high priority"},
+        {"client_id":"C003","kpi_name":"cost_savings_usd","baseline_value":0,
+         "unit":"$/month","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Finance",
+         "notes":"No AI savings before go-live"},
+        {"client_id":"C003","kpi_name":"aml_alert_review_time_hrs","baseline_value":3.8,
+         "unit":"hours","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Compliance system",
+         "notes":"Manual AML alert review per case"},
+        {"client_id":"C003","kpi_name":"loan_processing_days","baseline_value":5.2,
+         "unit":"days","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Core banking",
+         "notes":"End-to-end loan application processing"},
+        {"client_id":"C003","kpi_name":"false_positive_aml_rate","baseline_value":68,
+         "unit":"%","baseline_start":"2025-11-15","baseline_end":"2025-12-14",
+         "captured_at":"2025-12-14","captured_by":"Aidapt AM","data_source":"Compliance system",
+         "notes":"% AML alerts that were false positives"},
     ])
+    for col in ["baseline_start","baseline_end","captured_at"]:
+        baselines[col] = pd.to_datetime(baselines[col])
 
     return {
-        "clients":        clients,
-        "solutions":      solutions,
-        "opportunities":  opportunities,
-        "opp_financials": opp_financials,
-        "kpi_daily":      kpi_daily,
-        "kpi_monthly":    kpi_monthly,
-        "baselines":      baselines,
+        "clients":          clients,
+        "opportunities":    opportunities,
+        "opp_financials":   opp_financials,
+        "kpi_daily":        kpi_daily,
+        "kpi_monthly":      kpi_monthly,
+        "solutions":        solutions,
+        "ticket_sentiment": ticket_sentiment,
+        "baselines":        baselines,
+        "_source":    "demo",
+        "_refreshed": datetime.datetime.now().strftime("%d %b %Y %H:%M"),
     }
