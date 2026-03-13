@@ -1,10 +1,10 @@
 """Reusable Plotly chart builders — Aidapt premium dark theme."""
-
+ 
 import copy
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-
+ 
 # ── Brand colours ──────────────────────────────────────────────────────────────
 TEAL   = "#00C9B1"
 BLUE   = "#3B82F6"
@@ -14,14 +14,14 @@ GREEN  = "#10B981"
 RED    = "#EF4444"
 SLATE  = "#475569"
 MUTED  = "rgba(255,255,255,0.25)"
-
+ 
 CLIENT_COLORS = {}
 CLIENT_NAMES  = {}
-
+ 
 COLOR_CYCLE = ["#3B82F6", "#8B5CF6", "#F59E0B", "#00C9B1", "#10B981", "#EF4444",
                "#F97316", "#06B6D4", "#EC4899", "#A855F7", "#14B8A6", "#FBBF24"]
 PALETTE = COLOR_CYCLE[:]
-
+ 
 # ── Shared layout ──────────────────────────────────────────────────────────────
 LAYOUT_BASE = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -57,8 +57,8 @@ LAYOUT_BASE = dict(
         namelength=-1,
     ),
 )
-
-
+ 
+ 
 def build_client_maps(clients_df: pd.DataFrame):
     global CLIENT_NAMES, CLIENT_COLORS
     CLIENT_NAMES  = {}
@@ -67,11 +67,11 @@ def build_client_maps(clients_df: pd.DataFrame):
         cid = row["client_id"]
         CLIENT_NAMES[cid]  = row["client_name"]
         CLIENT_COLORS[cid] = COLOR_CYCLE[i % len(COLOR_CYCLE)]
-
-
+ 
+ 
 def client_name(cid):  return CLIENT_NAMES.get(cid, cid)
 def client_color(cid): return CLIENT_COLORS.get(cid, TEAL)
-
+ 
 def _hex_to_rgba(hex_color, alpha=0.8):
     try:
         h = hex_color.lstrip("#")
@@ -79,38 +79,37 @@ def _hex_to_rgba(hex_color, alpha=0.8):
         return f"rgba({r},{g},{b},{alpha})"
     except Exception:
         return f"rgba(0,201,177,{alpha})"
-
+ 
 def _to_num(series):
     return pd.to_numeric(series, errors="coerce")
-
+ 
 def _fig(title=""):
-    fig = go.Figure()
-    title_obj = dict(
+    title_obj = go.layout.Title(
         text=title,
         font=dict(size=13, color="rgba(255,255,255,0.9)", family="DM Sans"),
         x=0, xanchor="left", pad=dict(b=4),
     ) if title else None
-
-    fig.update_layout(
+ 
+    layout = go.Layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans, sans-serif", color="rgba(255,255,255,0.55)", size=11),
         margin=dict(l=12, r=12, t=36, b=8),
-        xaxis=dict(
+        xaxis=go.layout.XAxis(
             gridcolor="rgba(255,255,255,0.04)",
             zerolinecolor="rgba(255,255,255,0.06)",
             tickfont=dict(size=10, color="rgba(255,255,255,0.4)"),
             linecolor="rgba(255,255,255,0.06)",
             showgrid=True,
         ),
-        yaxis=dict(
+        yaxis=go.layout.YAxis(
             gridcolor="rgba(255,255,255,0.04)",
             zerolinecolor="rgba(255,255,255,0.06)",
             tickfont=dict(size=10, color="rgba(255,255,255,0.4)"),
             linecolor="rgba(0,0,0,0)",
             showgrid=True,
         ),
-        legend=dict(
+        legend=go.layout.Legend(
             bgcolor="rgba(15,25,35,0.7)",
             bordercolor="rgba(255,255,255,0.06)",
             borderwidth=1,
@@ -120,33 +119,33 @@ def _fig(title=""):
             xanchor="center", x=0.5,
             itemgap=16,
         ),
-        hoverlabel=dict(
+        hoverlabel=go.layout.Hoverlabel(
             bgcolor="#0F1E2D",
             bordercolor="rgba(255,255,255,0.12)",
             font=dict(color="white", size=12, family="DM Sans"),
             namelength=-1,
         ),
-        **({"title": title_obj} if title_obj else {}),
+        title=title_obj,
     )
-    return fig
-
+    return go.Figure(layout=layout)
+ 
 def config():
     return {"displayModeBar": False, "responsive": True}
-
+ 
 def fmt_currency(v, decimals=0):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
     if abs(v) >= 1_000_000: return f"${v/1_000_000:.1f}M"
     if abs(v) >= 1_000:     return f"${v/1_000:.0f}K"
     return f"${v:.{decimals}f}"
-
+ 
 def fmt_pct(v, decimals=1):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
     return f"{v*100:.{decimals}f}%" if abs(v) < 10 else f"{v:.{decimals}f}%"
-
+ 
 def fmt_num(v, decimals=0):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
     return f"{v:,.{decimals}f}"
-
+ 
 def kpi_card(label, value, unit="", delta="", delta_type="flat", accent=TEAL):
     delta_cls = {"up":"delta-up","down":"delta-down","flat":"delta-flat"}.get(delta_type,"delta-flat")
     arrow = {"up":"▲ ","down":"▼ ","flat":""}.get(delta_type,"")
@@ -154,11 +153,11 @@ def kpi_card(label, value, unit="", delta="", delta_type="flat", accent=TEAL):
             f'<div class="kpi-label">{label}</div>'
             f'<div class="kpi-value">{value}<span class="kpi-unit">{unit}</span></div>'
             f'<div class="kpi-delta {delta_cls}">{arrow}{delta}</div></div>')
-
+ 
 def badge(text, status="live"):
     return f'<span class="badge badge-{status}">{text}</span>'
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LINE CHART  — glowing line, smooth area fill, dot markers with halo
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,13 +166,13 @@ def line_chart(df, x, y_cols, names=None, colors=None, title="", y_fmt=None, das
     colors    = colors or PALETTE
     dash_cols = dash_cols or []
     single    = len(y_cols) == 1
-
+ 
     for i, col in enumerate(y_cols):
         name  = (names or y_cols)[i]
         color = colors[i % len(colors)]
         dash  = "dot" if col in dash_cols else "solid"
         rgba_fill = _hex_to_rgba(color, 0.10)
-
+ 
         fig.add_trace(go.Scatter(
             x=df[x], y=df[col], name=name,
             mode="lines+markers",
@@ -187,7 +186,7 @@ def line_chart(df, x, y_cols, names=None, colors=None, title="", y_fmt=None, das
             fillcolor=rgba_fill if single else None,
             hovertemplate=f"<b>{name}</b><br>%{{x}}<br>%{{y}}<extra></extra>",
         ))
-
+ 
         # glow layer (wider, transparent line behind)
         fig.add_trace(go.Scatter(
             x=df[x], y=df[col], name=name,
@@ -196,30 +195,30 @@ def line_chart(df, x, y_cols, names=None, colors=None, title="", y_fmt=None, das
             showlegend=False,
             hoverinfo="skip",
         ))
-
+ 
     # bring data lines to front by reordering traces
     n = len(y_cols)
     order = list(range(0, 2*n, 2)) + list(range(1, 2*n, 2))  # data traces first, glows last
     fig.data = tuple(fig.data[i] for i in order)
-
+ 
     fig.update_layout(height=300)
     if y_fmt:
         fig.update_yaxes(tickformat=y_fmt)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BAR CHART  — rounded, gradient-ish color with subtle hover highlight
 # ══════════════════════════════════════════════════════════════════════════════
 def bar_chart(df, x, y, color=TEAL, title="", horizontal=False, y_fmt=None, text=None):
     fig = _fig(title)
-
+ 
     # Build per-bar color list if a list was passed, otherwise single color
     if isinstance(color, list):
         bar_colors = color
     else:
         bar_colors = color
-
+ 
     fig.add_trace(go.Bar(
         x=df[y] if horizontal else df[x],
         y=df[x] if horizontal else df[y],
@@ -235,14 +234,14 @@ def bar_chart(df, x, y, color=TEAL, title="", horizontal=False, y_fmt=None, text
         textfont=dict(size=10, color="rgba(255,255,255,0.7)"),
         hovertemplate="%{y}" if horizontal else "%{x}<br><b>%{y:,.0f}</b><extra></extra>",
     ))
-
+ 
     fig.update_layout(height=300)
     if y_fmt:
         ax = "xaxis" if horizontal else "yaxis"
         fig.update_layout(**{ax: dict(tickformat=y_fmt)})
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MULTI-BAR  — grouped/stacked with rounded corners and opacity depth
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,8 +260,8 @@ def multi_bar(df, x, y_cols, names=None, colors=None, title="", stacked=False, y
     if y_fmt:
         fig.update_yaxes(tickformat=y_fmt)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COMBO  — bar (filled) + dotted line on secondary axis
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,8 +288,8 @@ def combo_chart(df, x, bar_col, line_col, bar_name="", line_name="",
         barmode="group", height=300,
     )
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DONUT  — thick ring, dark separator, center annotation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,8 +313,8 @@ def donut(labels, values, title="", colors=None):
             text=title, font=dict(size=13, color="rgba(255,255,255,0.9)"), x=0, xanchor="left"))
     fig.update_layout(showlegend=False, height=280)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BUBBLE CHART
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,8 +345,8 @@ def bubble_chart(df, x, y, size, color_col=None, label_col=None, title="",
     fig.update_yaxes(range=[0.5,5.5], title_text=y_title, title_font=dict(size=10, color=MUTED))
     fig.update_layout(height=400)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GAUGE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -372,8 +371,8 @@ def gauge(value, title="", max_val=5, color=TEAL):
                       margin=dict(l=20,r=20,t=50,b=20),
                       font=dict(family="DM Sans", color="rgba(255,255,255,0.6)"), height=180)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OPPORTUNITY CHARTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -391,13 +390,13 @@ def build_opportunity_bubble(opps: pd.DataFrame, fin: pd.DataFrame):
             merged["_size"] = 20000
     else:
         merged["_size"] = 20000
-
+ 
     _fs = next((c for c in ["feasibility_score"] if c in merged.columns), None)
     _vs = next((c for c in ["value_score"]       if c in merged.columns), None)
     _st = next((c for c in ["initiative_status","status"] if c in merged.columns), None)
     if not _fs or not _vs:
         return fig
-
+ 
     status_colors = {"Live":TEAL,"Pilot":BLUE,"In Pilot":BLUE,"Backlog":"#64748B","Paused":RED}
     for cid in merged["client_id"].unique():
         sub = merged[merged["client_id"]==cid].copy()
@@ -423,8 +422,8 @@ def build_opportunity_bubble(opps: pd.DataFrame, fin: pd.DataFrame):
     fig.update_yaxes(range=[0.5,5.5], title_text="Value Score →",       title_font=dict(size=10, color=MUTED))
     fig.update_layout(height=400)
     return fig
-
-
+ 
+ 
 def build_value_by_function(opps: pd.DataFrame, fin: pd.DataFrame):
     fig = _fig("Net Benefit by Function")
     if opps.empty or fin.empty: return fig
@@ -447,12 +446,12 @@ def build_value_by_function(opps: pd.DataFrame, fin: pd.DataFrame):
     fig.update_xaxes(tickprefix="$", tickformat=",.0f")
     fig.update_layout(height=400)
     return fig
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SUPPORT / TICKET CHARTS  — heavily redesigned
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 def build_automation_trend(daily: pd.DataFrame, client_ids: list):
     fig = _fig("Automation Runs — Weekly Trend")
     for cid in client_ids:
@@ -475,8 +474,8 @@ def build_automation_trend(daily: pd.DataFrame, client_ids: list):
         ))
     fig.update_layout(yaxis=dict(title_text="Runs / Week", title_font=dict(size=10)), height=310)
     return fig
-
-
+ 
+ 
 def build_support_ticket_trend(daily: pd.DataFrame, client_ids: list):
     """Created vs Closed — grouped bars per client, closed shown as outlined/lighter."""
     fig = _fig("Support Tickets — Created vs Closed")
@@ -492,7 +491,7 @@ def build_support_ticket_trend(daily: pd.DataFrame, client_ids: list):
         )
         color = client_color(cid)
         cname = client_name(cid)
-
+ 
         # Created — solid fill
         fig.add_trace(go.Bar(
             x=grp["month"], y=grp["created"],
@@ -511,12 +510,12 @@ def build_support_ticket_trend(daily: pd.DataFrame, client_ids: list):
             ),
             hovertemplate=f"<b>{cname} Closed</b><br>%{{x}}<br><b>%{{y:,.0f}} tickets</b><extra></extra>",
         ))
-
+ 
     fig.update_layout(barmode="group", height=310,
                       bargap=0.18, bargroupgap=0.06)
     return fig
-
-
+ 
+ 
 def build_tickets_open_trend(daily: pd.DataFrame, client_ids: list):
     """Open backlog with smooth area fill and gradient under curve."""
     fig = _fig("Open Ticket Backlog — Weekly Avg")
@@ -529,7 +528,7 @@ def build_tickets_open_trend(daily: pd.DataFrame, client_ids: list):
         wk    = df.groupby("week", as_index=False)["tickets_open"].mean()
         color = client_color(cid)
         cname = client_name(cid)
-
+ 
         # glow layer
         fig.add_trace(go.Scatter(
             x=wk["week"], y=wk["tickets_open"], showlegend=False,
@@ -545,11 +544,11 @@ def build_tickets_open_trend(daily: pd.DataFrame, client_ids: list):
             fill="tozeroy", fillcolor=_hex_to_rgba(color, 0.07),
             hovertemplate=f"<b>{cname}</b><br>%{{x|%b %d}}<br><b>%{{y:.1f}} open tickets</b><extra></extra>",
         ))
-
+ 
     fig.update_layout(yaxis=dict(title_text="Avg Open Tickets", title_font=dict(size=10)), height=310)
     return fig
-
-
+ 
+ 
 def build_high_priority_trend(daily: pd.DataFrame, client_ids: list):
     """High priority weekly — stacked bars with alert-red accent per client."""
     fig = _fig("High Priority Tickets — Weekly")
@@ -562,7 +561,7 @@ def build_high_priority_trend(daily: pd.DataFrame, client_ids: list):
         wk    = df.groupby("week", as_index=False)["high_priority_count"].sum()
         color = client_color(cid)
         cname = client_name(cid)
-
+ 
         fig.add_trace(go.Bar(
             x=wk["week"], y=wk["high_priority_count"], name=cname,
             marker=dict(
@@ -571,7 +570,7 @@ def build_high_priority_trend(daily: pd.DataFrame, client_ids: list):
             ),
             hovertemplate=f"<b>{cname}</b><br>%{{x|%b %d}}<br><b>%{{y:,.0f}} high priority</b><extra></extra>",
         ))
-
+ 
     # add a mean reference line across all clients combined
     all_vals_days = daily.copy()
     if "high_priority_count" in all_vals_days.columns:
@@ -587,11 +586,11 @@ def build_high_priority_trend(daily: pd.DataFrame, client_ids: list):
                 annotation_font=dict(color="rgba(239,68,68,0.7)", size=10),
                 annotation_position="top right",
             )
-
+ 
     fig.update_layout(barmode="group", height=310, bargap=0.2, bargroupgap=0.08)
     return fig
-
-
+ 
+ 
 def build_resolution_time_trend(daily: pd.DataFrame, client_ids: list):
     """Avg resolution time — smooth lines with directional color hint."""
     fig = _fig("Avg Resolution Time — Weekly (hrs)")
@@ -604,7 +603,7 @@ def build_resolution_time_trend(daily: pd.DataFrame, client_ids: list):
         wk    = df.groupby("week", as_index=False)["avg_resolution_hrs"].mean()
         color = client_color(cid)
         cname = client_name(cid)
-
+ 
         # glow
         fig.add_trace(go.Scatter(
             x=wk["week"], y=wk["avg_resolution_hrs"], showlegend=False,
@@ -618,16 +617,16 @@ def build_resolution_time_trend(daily: pd.DataFrame, client_ids: list):
             marker=dict(size=7, color="#0F1923", line=dict(color=color, width=2.5)),
             hovertemplate=f"<b>{cname}</b><br>%{{x|%b %d}}<br><b>%{{y:.1f}} hrs</b><extra></extra>",
         ))
-
+ 
     fig.update_layout(yaxis=dict(title_text="Avg Resolution (hrs)", title_font=dict(size=10)), height=310)
     return fig
-
-
+ 
+ 
 def build_baseline_comparison(daily: pd.DataFrame, baselines: pd.DataFrame, client_id: str):
     fig = _fig("Before vs After AI · Key KPIs")
     if daily.empty or baselines is None or baselines.empty:
         return fig
-
+ 
     kpis = [
         ("avg_resolution_hrs",      "Avg Resolution (hrs)"),
         ("support_tickets_created", "Daily Tickets Created"),
@@ -647,9 +646,9 @@ def build_baseline_comparison(daily: pd.DataFrame, baselines: pd.DataFrame, clie
         labels.append(label)
         before_vals.append(round(bl_val, 1))
         after_vals.append(round(current, 1))
-
+ 
     if not labels: return fig
-
+ 
     client_col = CLIENT_COLORS.get(client_id, TEAL)
     fig.update_layout(barmode="group", height=320)
     fig.add_trace(go.Bar(
