@@ -1,5 +1,6 @@
 """Reusable Plotly chart builders — Aidapt premium dark theme."""
 
+import copy
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
@@ -84,7 +85,7 @@ def _to_num(series):
 
 def _fig(title=""):
     fig = go.Figure()
-    lay = {k: v for k, v in LAYOUT_BASE.items()}
+    lay = copy.deepcopy(LAYOUT_BASE)
     if title:
         lay["title"] = dict(
             text=title,
