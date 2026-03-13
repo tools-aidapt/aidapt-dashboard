@@ -319,34 +319,44 @@ def render(data, selected_client, filter_banner=""):
                 unsafe_allow_html=True)
 
     summary_rows = []
-    for _, cl in data["clients"].iterrows():
-        cid = cl["client_id"]
-        mon = data["kpi_monthly"][data["kpi_monthly"]["client_id"] == cid]
-        day = data["kpi_daily"][data["kpi_daily"]["client_id"] == cid]
-        fin = data["opp_financials"][data["opp_financials"]["client_id"] == cid]
-        sol = data["solutions"][data["solutions"]["client_id"] == cid]
-        opp = data["opportunities"][data["opportunities"]["client_id"] == cid]
+    # Guard: only iterate if client_id column exists
+    if "client_id" in data["clients"].columns:
+        for _, cl in data["clients"].iterrows():
+            try:
+                cid  = cl["client_id"]
+                # Safe filter — only filter if client_id col exists in each tab
+                def _safe_filter(df, cid):
+                    if df.empty or "client_id" not in df.columns:
+                        return df
+                    return df[df["client_id"] == cid]
 
-        _rc = _scol(mon, "actual_roi_multiple","roi_percent","actual_roi")
-        latest_roi = (mon.dropna(subset=[_rc]).sort_values("month")[_rc].iloc[-1]
-                      if _rc and not mon.dropna(subset=[_rc]).empty else None)
+                mon = _safe_filter(data["kpi_monthly"], cid)
+                day = _safe_filter(data["kpi_daily"], cid)
+                fin = _safe_filter(data["opp_financials"], cid)
+                sol = _safe_filter(data["solutions"], cid)
+                opp = _safe_filter(data["opportunities"], cid)
 
-        _pb = _scol(fin, "payback_months","payback_period_months","payback")
-        _sc = next((c for c in ["status","phase"] if c in sol.columns), None)
-        live_s = len(sol[sol[_sc] == "Live"]) if _sc and not sol.empty else 0
-        avg_res = _to_num(day["avg_resolution_hrs"]).mean() if "avg_resolution_hrs" in day.columns else None
-        avg_open_bl = _to_num(day["tickets_open"]).mean() if "tickets_open" in day.columns else None
+                _rc = _scol(mon, "actual_roi_multiple","roi_percent","actual_roi")
+                latest_roi = (mon.dropna(subset=[_rc]).sort_values("month")[_rc].iloc[-1]
+                              if _rc and not mon.dropna(subset=[_rc]).empty else None)
 
-        summary_rows.append({
-            "Client":           cl["client_name"],
-            "Type":             cl.get("client_type","—"),
-            "Solutions Live":   live_s,
-            "Hours Saved":      f'{_to_num(mon["hours_saved"]).sum():,.0f} hrs' if "hours_saved" in mon.columns else "—",
-            "Cost Savings":     fmt_currency(_ssum(mon,"cost_savings_usd","cost_savings")),
-            "ROI (Actual)":     f'{latest_roi:.2f}x' if latest_roi is not None else "—",
-            "Avg Resolution":   f'{avg_res:.0f} hrs' if avg_res and not np.isnan(avg_res) else "—",
-            "Avg Open Backlog": f'{avg_open_bl:.0f}' if avg_open_bl and not np.isnan(avg_open_bl) else "—",
-            "Open Opps":        len(opp[opp.get("initiative_status", pd.Series()).isin(["Backlog","In Pilot"])]) if "initiative_status" in opp.columns else 0,
-        })
+                _sc    = next((c for c in ["status","phase"] if c in sol.columns), None)
+                live_s = len(sol[sol[_sc] == "Live"]) if _sc and not sol.empty else 0
+                avg_res     = _to_num(day["avg_resolution_hrs"]).mean() if "avg_resolution_hrs" in day.columns else None
+                avg_open_bl = _to_num(day["tickets_open"]).mean()       if "tickets_open" in day.columns else None
+
+                summary_rows.append({
+                    "Client":           cl.get("client_name", cid),
+                    "Type":             cl.get("client_type", "—"),
+                    "Solutions Live":   live_s,
+                    "Hours Saved":      f'{_to_num(mon["hours_saved"]).sum():,.0f} hrs' if "hours_saved" in mon.columns else "—",
+                    "Cost Savings":     fmt_currency(_ssum(mon,"cost_savings_usd","cost_savings")),
+                    "ROI (Actual)":     f'{latest_roi:.2f}x' if latest_roi is not None else "—",
+                    "Avg Resolution":   f'{avg_res:.0f} hrs' if avg_res and not np.isnan(avg_res) else "—",
+                    "Avg Open Backlog": f'{avg_open_bl:.0f}' if avg_open_bl and not np.isnan(avg_open_bl) else "—",
+                    "Open Opps":        len(opp[opp["initiative_status"].isin(["Backlog","In Pilot"])]) if "initiative_status" in opp.columns else 0,
+                })
+            except Exception:
+                continue
 
     st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True, height=180)
