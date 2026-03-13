@@ -85,14 +85,49 @@ def _to_num(series):
 
 def _fig(title=""):
     fig = go.Figure()
-    lay = copy.deepcopy(LAYOUT_BASE)
-    if title:
-        lay["title"] = dict(
-            text=title,
-            font=dict(size=13, color="rgba(255,255,255,0.9)", family="DM Sans"),
-            x=0, xanchor="left", pad=dict(b=4),
-        )
-    fig.update_layout(**lay)
+    title_obj = dict(
+        text=title,
+        font=dict(size=13, color="rgba(255,255,255,0.9)", family="DM Sans"),
+        x=0, xanchor="left", pad=dict(b=4),
+    ) if title else None
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans, sans-serif", color="rgba(255,255,255,0.55)", size=11),
+        margin=dict(l=12, r=12, t=36, b=8),
+        xaxis=dict(
+            gridcolor="rgba(255,255,255,0.04)",
+            zerolinecolor="rgba(255,255,255,0.06)",
+            tickfont=dict(size=10, color="rgba(255,255,255,0.4)"),
+            linecolor="rgba(255,255,255,0.06)",
+            showgrid=True,
+        ),
+        yaxis=dict(
+            gridcolor="rgba(255,255,255,0.04)",
+            zerolinecolor="rgba(255,255,255,0.06)",
+            tickfont=dict(size=10, color="rgba(255,255,255,0.4)"),
+            linecolor="rgba(0,0,0,0)",
+            showgrid=True,
+        ),
+        legend=dict(
+            bgcolor="rgba(15,25,35,0.7)",
+            bordercolor="rgba(255,255,255,0.06)",
+            borderwidth=1,
+            font=dict(size=10, color="rgba(255,255,255,0.65)"),
+            orientation="h",
+            yanchor="bottom", y=-0.28,
+            xanchor="center", x=0.5,
+            itemgap=16,
+        ),
+        hoverlabel=dict(
+            bgcolor="#0F1E2D",
+            bordercolor="rgba(255,255,255,0.12)",
+            font=dict(color="white", size=12, family="DM Sans"),
+            namelength=-1,
+        ),
+        **({"title": title_obj} if title_obj else {}),
+    )
     return fig
 
 def config():
